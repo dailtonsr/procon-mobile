@@ -578,7 +578,7 @@ function startAutoRefresh(){
     setTimeout(()=>dot.classList.remove('active'),500);
     S.ws.send(JSON.stringify({type:'refresh',what:'players'}));
     S.ws.send(JSON.stringify({type:'refresh',what:'serverInfo'}));
-  },10000);
+  },2000);
 }
 
 function clearTimers(){
