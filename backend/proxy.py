@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 PRoCon Mobile — WebSocket ↔ BF4 RCON Proxy
-BF4 RCON: servidor fala primeiro enviando o salt diretamente
+Protocolo confirmado pelo DEBUG.txt do PRoCon:
+  cliente → login.hashed (sem params)
+  servidor → OK + salt
+  cliente → login.hashed + MD5(salt+password)
+  servidor → OK
 """
 
 import asyncio
@@ -44,40 +48,20 @@ def parse_packets(buf):
         rest = rest[total:]
     return packets, rest
 
-async def read_one(reader, timeout=8.0):
-    """Lê um único pacote do servidor."""
-    buf = b''
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            return None
-        try:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining)
-            if not chunk:
-                return None
-            buf += chunk
-            pkts, _ = parse_packets(buf)
-            if pkts:
-                print(f"[read_one] {pkts[0]['words']}")
-                return pkts[0]
-        except asyncio.TimeoutError:
-            return None
-
 async def handler(ws):
     print(f"[+] {ws.remote_address}")
     reader = writer = None
     buf = b''
     pending = {}
 
-    async def send_cmd(*words):
+    async def send_cmd(*words, timeout=15.0):
         pkt, seq = mk_packet(list(words))
         fut = asyncio.get_event_loop().create_future()
         pending[seq] = fut
         writer.write(pkt)
         await writer.drain()
         try:
-            return await asyncio.wait_for(fut, timeout=8.0)
+            return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             pending.pop(seq, None)
             print(f"[timeout] {words[0]}")
@@ -107,7 +91,8 @@ async def handler(ws):
         if cmd == 'player.onChat':
             await ws.send(json.dumps({
                 'type':'chat','player':words[1] if len(words)>1 else '?',
-                'text':words[2] if len(words)>2 else '','subset':words[3] if len(words)>3 else 'All','isAdmin':False
+                'text':words[2] if len(words)>2 else '',
+                'subset':words[3] if len(words)>3 else 'All','isAdmin':False
             }))
         elif cmd in ('player.onJoin','player.onLeave'):
             await refresh_players()
@@ -165,74 +150,38 @@ async def handler(ws):
                 print(f"[→] {host}:{port}")
                 try:
                     reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), timeout=10)
+                        asyncio.open_connection(host, port), timeout=15)
                     print(f"[✓] TCP connected")
                 except Exception as e:
                     await ws.send(json.dumps({'type':'error','message':f'Cannot connect: {e}'}))
                     continue
 
-                # ── BF4 RCON: servidor envia login.hashed com salt primeiro ──
-                # Lê o primeiro pacote que o servidor envia
-                first = await read_one(reader, timeout=5.0)
-                print(f"[first packet] {first}")
+                # Inicia recv_loop imediatamente
+                asyncio.ensure_future(recv_loop())
 
-                salt = None
+                # Protocolo confirmado pelo DEBUG.txt:
+                # cliente → login.hashed (sem params) com timeout maior
+                print(f"[→] Sending login.hashed...")
+                r1 = await send_cmd('login.hashed', timeout=20.0)
+                print(f"[login.hashed response] {r1}")
 
-                if first and first['words']:
-                    words = first['words']
-                    cmd = words[0]
-
-                    if cmd == 'login.hashed' and len(words) >= 2:
-                        # Servidor enviou salt diretamente
-                        salt = words[1]
-                        print(f"[✓] Server sent salt: {salt}")
-
-                    elif cmd == 'version':
-                        # Servidor enviou versão — agora pede salt
-                        print(f"[version] {words}")
-                        asyncio.ensure_future(recv_loop())
-                        r1 = await send_cmd('login.hashed')
-                        print(f"[login.hashed] {r1}")
-                        if r1 and r1[0] == 'OK' and len(r1) >= 2:
-                            salt = r1[1]
-
-                    else:
-                        # Outro pacote — inicia recv_loop e tenta login.hashed
-                        print(f"[unknown first] {words} — trying login.hashed")
-                        asyncio.ensure_future(recv_loop())
-                        r1 = await send_cmd('login.hashed')
-                        print(f"[login.hashed] {r1}")
-                        if r1 and r1[0] == 'OK' and len(r1) >= 2:
-                            salt = r1[1]
-
-                else:
-                    # Nada recebido — servidor espera que cliente fale
-                    print(f"[no first packet] — trying version then login.hashed")
-                    asyncio.ensure_future(recv_loop())
-                    await send_cmd('version')
-                    r1 = await send_cmd('login.hashed')
-                    print(f"[login.hashed after version] {r1}")
-                    if r1 and r1[0] == 'OK' and len(r1) >= 2:
-                        salt = r1[1]
-
-                if not salt:
-                    await ws.send(json.dumps({'type':'error','message':'Could not get salt from server'}))
+                if not r1:
+                    await ws.send(json.dumps({'type':'error','message':'Server did not respond to login.hashed — check if server is online'}))
                     continue
 
-                # Garante recv_loop rodando
-                if not any(True for t in asyncio.all_tasks() if 'recv_loop' in str(t)):
-                    asyncio.ensure_future(recv_loop())
+                if r1[0] != 'OK' or len(r1) < 2:
+                    await ws.send(json.dumps({'type':'error','message':f'Unexpected response: {r1}'}))
+                    continue
+
+                salt = r1[1]
+                print(f"[✓] Salt: {salt}")
 
                 # Hash: MD5(salt_bytes + password_bytes)
-                try:
-                    hashed = hashlib.md5(
-                        bytes.fromhex(salt) + password.encode('utf-8')
-                    ).hexdigest().upper()
-                except Exception as e:
-                    await ws.send(json.dumps({'type':'error','message':f'Hash error: {e}'}))
-                    continue
+                hashed = hashlib.md5(
+                    bytes.fromhex(salt) + password.encode('utf-8')
+                ).hexdigest().upper()
 
-                r2 = await send_cmd('login.hashed', hashed)
+                r2 = await send_cmd('login.hashed', hashed, timeout=15.0)
                 print(f"[login result] {r2}")
 
                 if not r2 or r2[0] != 'OK':
