@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
+"""
+PRoCon Mobile — WebSocket ↔ PRoCon Layer Proxy
+Hash correto para PRoCon Layer:
+  MD5(MD5(password).upper() + salt)
+"""
+
 import asyncio, hashlib, json, os, struct, traceback, websockets
 from websockets.server import serve
+
 PORT = int(os.environ.get('PORT', 8080))
 HEADER = 12
 _seq = 0
@@ -28,18 +35,6 @@ def parse_packets(buf):
         packets.append({'seq': seq & 0x3FFFFFFF, 'resp': bool(seq & 0x80000000), 'words': words})
         rest = rest[total:]
     return packets, rest
-
-async def read_first(reader, timeout=5.0):
-    try:
-        chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if not chunk: return None
-        pkts, _ = parse_packets(chunk)
-        if pkts:
-            print(f"[first] {pkts[0]['words']}")
-            return pkts[0]
-    except asyncio.TimeoutError:
-        print(f"[first] timeout — server silent")
-    return None
 
 async def handler(ws):
     print(f"[+] {ws.remote_address}")
@@ -76,8 +71,10 @@ async def handler(ws):
     async def on_event(words):
         if not words: return
         if words[0] == 'player.onChat':
-            await ws.send(json.dumps({'type':'chat','player':words[1] if len(words)>1 else '?',
-                'text':words[2] if len(words)>2 else '','subset':words[3] if len(words)>3 else 'All','isAdmin':False}))
+            await ws.send(json.dumps({'type':'chat',
+                'player':words[1] if len(words)>1 else '?',
+                'text':words[2] if len(words)>2 else '',
+                'subset':words[3] if len(words)>3 else 'All','isAdmin':False}))
         elif words[0] in ('player.onJoin','player.onLeave'):
             r = await send_cmd('admin.listPlayers','all')
             if r: await ws.send(json.dumps({'type':'players','players':parse_pl(r)}))
@@ -96,57 +93,74 @@ async def handler(ws):
         except Exception as e: print(f"[parse] {e}")
         return out
 
+    def compute_hash(salt_hex, password):
+        """
+        PRoCon Layer hash:
+        1. pass_md5 = MD5(password).hexdigest().upper()
+        2. final = MD5(salt_bytes + pass_md5.encode()).hexdigest().upper()
+        """
+        pass_md5 = hashlib.md5(password.encode('utf-8')).hexdigest().upper()
+        salt_bytes = bytes.fromhex(salt_hex)
+        final = hashlib.md5(salt_bytes + pass_md5.encode('utf-8')).hexdigest().upper()
+        print(f"[hash] pass_md5={pass_md5[:8]}... final={final[:8]}...")
+        return final
+
+    def compute_hash_rcon(salt_hex, password):
+        """
+        RCON puro BF4 hash:
+        MD5(salt_bytes + password_bytes).upper()
+        """
+        salt_bytes = bytes.fromhex(salt_hex)
+        final = hashlib.md5(salt_bytes + password.encode('utf-8')).hexdigest().upper()
+        print(f"[hash_rcon] final={final[:8]}...")
+        return final
+
     try:
         async for raw in ws:
             msg = json.loads(raw)
+
             if msg['type'] == 'connect':
                 host=msg['host']; port=int(msg['port']); password=msg.get('pass','')
                 print(f"[→] {host}:{port}")
+
                 try:
-                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=15)
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=15)
                     print(f"[✓] TCP connected")
                 except Exception as e:
                     await ws.send(json.dumps({'type':'error','message':f'Cannot connect: {e}'})); continue
 
-                # Escuta primeiro pacote do servidor
-                first = await read_first(reader, timeout=5.0)
-                salt = None
+                asyncio.ensure_future(recv_loop())
 
-                if first and first['words']:
-                    words = first['words']
-                    print(f"[first words] {words}")
-                    if words[0] == 'login.hashed' and len(words) >= 2:
-                        # Servidor enviou salt diretamente
-                        salt = words[1]
-                        print(f"[✓] Server sent salt: {salt}")
-                        asyncio.ensure_future(recv_loop())
-                    else:
-                        asyncio.ensure_future(recv_loop())
-                        r1 = await send_cmd('login.hashed', timeout=20.0)
-                        print(f"[login.hashed] {r1}")
-                        if r1 and r1[0]=='OK' and len(r1)>=2:
-                            salt = r1[1]
-                else:
-                    # Servidor não mandou nada — cliente fala primeiro
-                    asyncio.ensure_future(recv_loop())
-                    r1 = await send_cmd('login.hashed', timeout=20.0)
-                    print(f"[login.hashed after silence] {r1}")
-                    if r1 and r1[0]=='OK' and len(r1)>=2:
-                        salt = r1[1]
+                # Pede o salt
+                r1 = await send_cmd('login.hashed', timeout=20.0)
+                print(f"[login.hashed] {r1}")
 
-                if not salt:
-                    await ws.send(json.dumps({'type':'error','message':'Could not get salt from server'})); continue
+                if not r1 or r1[0] != 'OK' or len(r1) < 2:
+                    await ws.send(json.dumps({'type':'error','message':f'No salt: {r1}'})); continue
 
-                hashed = hashlib.md5(bytes.fromhex(salt)+password.encode('utf-8')).hexdigest().upper()
-                r2 = await send_cmd('login.hashed', hashed, timeout=15.0)
-                print(f"[login result] {r2}")
+                salt = r1[1]
+                print(f"[salt] {salt}")
 
-                if not r2 or r2[0]!='OK':
-                    await ws.send(json.dumps({'type':'error','message':'Wrong password'})); continue
+                # Tenta PRoCon Layer hash primeiro (duplo MD5)
+                hashed_layer = compute_hash(salt, password)
+                r2 = await send_cmd('login.hashed', hashed_layer, timeout=15.0)
+                print(f"[login layer] {r2}")
+
+                if not r2 or r2[0] != 'OK':
+                    # Tenta RCON puro hash
+                    print(f"[→] Layer hash falhou, tentando RCON hash...")
+                    hashed_rcon = compute_hash_rcon(salt, password)
+                    r2b = await send_cmd('login.hashed', hashed_rcon, timeout=15.0)
+                    print(f"[login rcon] {r2b}")
+
+                    if not r2b or r2b[0] != 'OK':
+                        await ws.send(json.dumps({'type':'error','message':'Wrong password'})); continue
 
                 await send_cmd('admin.eventsEnabled','true')
                 ri = await send_cmd('serverInfo')
                 sname = ri[1] if ri and len(ri)>1 else host
+
                 await ws.send(json.dumps({'type':'connected','serverName':sname}))
                 print(f"[✓] Auth OK — {sname}")
 
@@ -158,8 +172,11 @@ async def handler(ws):
                     scores={}
                     try: scores={'team1':int(r[8]) if len(r)>8 else 0,'team2':int(r[9]) if len(r)>9 else 0}
                     except: pass
-                    await ws.send(json.dumps({'type':'serverInfo','serverName':r[1] if len(r)>1 else '',
-                        'mapName':r[4] if len(r)>4 else '','modeName':r[5] if len(r)>5 else '','scores':scores}))
+                    await ws.send(json.dumps({'type':'serverInfo',
+                        'serverName':r[1] if len(r)>1 else '',
+                        'mapName':r[4] if len(r)>4 else '',
+                        'modeName':r[5] if len(r)>5 else '',
+                        'scores':scores}))
 
                 r=await send_cmd('mapList.list','0')
                 maps=[]
@@ -179,7 +196,8 @@ async def handler(ws):
                     await ws.send(json.dumps({'type':'error','message':'Not connected'})); continue
                 r=await send_cmd(msg.get('cmd',''),*msg.get('args',[]))
                 await ws.send(json.dumps({'type':'cmdResult',
-                    'result':' '.join(r) if r else 'no response','ok':bool(r and r[0]=='OK')}))
+                    'result':' '.join(r) if r else 'no response',
+                    'ok':bool(r and r[0]=='OK')}))
 
     except websockets.exceptions.ConnectionClosed: print(f"[-] Disconnected")
     except Exception as e: print(f"[!] {e}"); traceback.print_exc()
