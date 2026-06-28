@@ -324,7 +324,11 @@
           </div>
         </div>
         <div class="field">
-          <label>RCON Password</label>
+          <label>Username</label>
+          <input type="text" id="inp-user" class="input-mono" placeholder="admin" autocomplete="off" autocorrect="off" autocapitalize="none">
+        </div>
+        <div class="field">
+          <label>Password</label>
           <input type="password" id="inp-pass" placeholder="••••••••" autocomplete="current-password">
         </div>
         <button class="btn-primary" id="btn-connect" onclick="connectToServer()">Connect</button>
@@ -441,7 +445,7 @@
 <script>
 // ── CONFIG ─────────────────────────────────────────────────
 // URL do proxy Railway — substitua após o deploy
-const PROXY_URL = 'wss://procon-mobile-production.up.railway.app';
+const PROXY_URL = 'wss://SEU-PROJETO.up.railway.app';
 
 const REASONS = [
   "Hacking/Cheating",
@@ -553,11 +557,12 @@ function deleteSaved(e, i) {
 function connectToServer() {
   const host = document.getElementById('inp-host').value.trim();
   const port = parseInt(document.getElementById('inp-port').value.trim());
+  const user = document.getElementById('inp-user').value.trim() || 'admin';
   const pass = document.getElementById('inp-pass').value;
   const game = document.getElementById('inp-game').value;
 
   if (!host || !port) { toast('Fill host and port', 'error'); return; }
-  if (!pass) { toast('Enter RCON password', 'error'); return; }
+  if (!pass) { toast('Enter password', 'error'); return; }
 
   S.host = host; S.port = port; S.pass = pass;
 
@@ -572,7 +577,7 @@ function connectToServer() {
   ws.onopen = () => {
     showConnecting('Authenticating...');
     logConsole('Proxy connected — authenticating...', 'ok');
-    ws.send(JSON.stringify({ type:'connect', host, port, pass, game }));
+    ws.send(JSON.stringify({ type:'connect', host, port, username: user, pass, game }));
   };
 
   ws.onmessage = (e) => {
