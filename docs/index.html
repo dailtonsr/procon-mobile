@@ -564,7 +564,7 @@ function startHeartbeat(){
   clearInterval(S.heartbeatTimer);
   S.heartbeatTimer=setInterval(()=>{
     if(S.ws&&S.ws.readyState===WebSocket.OPEN){
-      S.ws.send(JSON.stringify({type:'cmd',cmd:'version',args:[]}));
+      S.ws.send(JSON.stringify({type:'ping'}));
     }
   },30000);
 }
