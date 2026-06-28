@@ -701,7 +701,7 @@ function renderPlayers(filter){
   function teamRows(arr, num){
     if(!arr.length) return '';
     const sorted=sortArr(arr);
-    const tickets=S.scores?.(num===1?S.scores.team1:S.scores.team2)||0;
+    const tickets=S.scores?(num===1?S.scores.team1:S.scores.team2)||0:0;
     const teamLabel=num===1?'🔵 US Army':'🔴 Russian Army';
     const cls=num===2?'team2':'';
     let rows=`<tr class="team-header-row ${cls}"><td colspan="9">${teamLabel}${tickets?' — '+tickets+' Tickets':''}</td></tr>`;
