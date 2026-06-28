@@ -2,9 +2,7 @@
 """
 PRoCon Mobile — WebSocket ↔ PRoCon Layer Proxy
 Deploy: Railway.app
-
-Conecta ao PRoCon Layer (não direto ao RCON do BF4)
-Login: username + password do Layer
+Protocolo: PRoCon Layer (não RCON direto)
 """
 
 import asyncio
@@ -70,6 +68,7 @@ async def handler(ws):
             return await asyncio.wait_for(fut, timeout=8.0)
         except asyncio.TimeoutError:
             pending.pop(seq, None)
+            print(f"[timeout] {words[0]}")
             return ['error', 'timeout']
 
     async def recv_loop():
@@ -96,6 +95,7 @@ async def handler(ws):
     async def on_event(words):
         if not words: return
         cmd = words[0]
+        print(f"[event] {cmd}")
         if cmd == 'player.onChat':
             await ws.send(json.dumps({
                 'type': 'chat',
@@ -114,6 +114,7 @@ async def handler(ws):
 
     async def refresh_info():
         r = await rcon('serverInfo')
+        print(f"[serverInfo] {r[:6] if r else 'none'}")
         if r and r[0] == 'OK' and len(r) > 5:
             scores = {}
             try:
@@ -175,7 +176,6 @@ async def handler(ws):
         async for raw in ws:
             msg = json.loads(raw)
 
-            # CONNECT — login via PRoCon Layer
             if msg['type'] == 'connect':
                 host     = msg['host']
                 port     = int(msg['port'])
@@ -187,7 +187,7 @@ async def handler(ws):
                 try:
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(host, port), timeout=10)
-                    print(f"[✓] TCP connected to {host}:{port}")
+                    print(f"[✓] TCP connected")
                 except Exception as e:
                     await ws.send(json.dumps({
                         'type': 'error',
@@ -197,57 +197,82 @@ async def handler(ws):
 
                 asyncio.ensure_future(recv_loop())
 
-                # PRoCon Layer login: login.hashed → MD5(salt + MD5(password))
+                # ── HANDSHAKE ──────────────────────────────
+                # Lê o primeiro pacote — pode ser login.hashed (RCON)
+                # ou procon.version (PRoCon Layer)
                 r1 = await rcon('login.hashed')
-                if not r1 or r1[0] != 'OK' or len(r1) < 2:
+                print(f"[handshake] r1={r1}")
+
+                if not r1:
                     await ws.send(json.dumps({
-                        'type': 'error',
-                        'message': 'Handshake failed — server did not respond'
+                        'type': 'error', 'message': 'No response from server'
                     }))
                     continue
 
-                salt = r1[1]
-                print(f"[→] Salt received: {salt}")
+                # PRoCon Layer responde com versão quando recebe login.hashed
+                # Detecta pelo primeiro word
+                if r1[0] == 'OK' and len(r1) >= 2:
+                    # RCON padrão — tem salt
+                    salt = r1[1]
+                    print(f"[rcon] salt={salt}")
 
-                # PRoCon Layer: hash = MD5(salt + MD5(password))
-                # Primeiro MD5 da senha
-                pass_md5 = hashlib.md5(password.encode('utf-8')).hexdigest().upper()
-                # Segundo MD5: salt (hex) + pass_md5
-                try:
-                    final_hash = hashlib.md5(
-                        bytes.fromhex(salt) + pass_md5.encode('utf-8')
-                    ).hexdigest().upper()
-                except Exception:
-                    # Fallback: salt como string
-                    final_hash = hashlib.md5(
-                        (salt + pass_md5).encode('utf-8')
-                    ).hexdigest().upper()
-
-                r2 = await rcon('login.hashed', final_hash)
-                print(f"[→] Login response: {r2}")
-
-                if not r2 or r2[0] != 'OK':
-                    # Tenta método alternativo: MD5(salt + password) direto
+                    # Tenta hash RCON puro: MD5(salt_bytes + password)
                     try:
-                        alt_hash = hashlib.md5(
+                        h1 = hashlib.md5(
                             bytes.fromhex(salt) + password.encode('utf-8')
                         ).hexdigest().upper()
-                        r2b = await rcon('login.hashed', alt_hash)
-                        print(f"[→] Alt login response: {r2b}")
-                        if r2b and r2b[0] == 'OK':
-                            r2 = r2b
-                        else:
-                            await ws.send(json.dumps({
-                                'type': 'error',
-                                'message': f'Wrong username or password'
-                            }))
-                            continue
+                        r2 = await rcon('login.hashed', h1)
+                        print(f"[rcon] login r2={r2}")
+
+                        if not r2 or r2[0] != 'OK':
+                            # Tenta hash Layer: MD5(salt_bytes + MD5(password))
+                            pass_md5 = hashlib.md5(password.encode('utf-8')).hexdigest().upper()
+                            h2 = hashlib.md5(
+                                bytes.fromhex(salt) + pass_md5.encode('utf-8')
+                            ).hexdigest().upper()
+                            r2b = await rcon('login.hashed', h2)
+                            print(f"[layer] login r2b={r2b}")
+
+                            if not r2b or r2b[0] != 'OK':
+                                await ws.send(json.dumps({
+                                    'type': 'error',
+                                    'message': 'Wrong password'
+                                }))
+                                continue
                     except Exception as e:
                         await ws.send(json.dumps({
-                            'type': 'error',
-                            'message': f'Login failed: {e}'
+                            'type': 'error', 'message': f'Login error: {e}'
                         }))
                         continue
+
+                elif r1[0] in ('procon.version', 'version', 'InvalidPasswordHash', 'InsufficientPrivileges'):
+                    # PRoCon Layer — protocolo diferente
+                    # Layer usa: procon.login username password_hash
+                    print(f"[layer] Detected PRoCon Layer protocol")
+
+                    # Hash para Layer: MD5(MD5(password) + username)
+                    pass_md5 = hashlib.md5(password.encode('utf-8')).hexdigest()
+                    combined = hashlib.md5((pass_md5 + username).encode('utf-8')).hexdigest().upper()
+
+                    r2 = await rcon('procon.login', username, combined)
+                    print(f"[layer] procon.login r2={r2}")
+
+                    if not r2 or r2[0] != 'OK':
+                        # Tenta com senha em texto puro
+                        r2b = await rcon('procon.login', username, password)
+                        print(f"[layer] plain r2b={r2b}")
+                        if not r2b or r2b[0] != 'OK':
+                            await ws.send(json.dumps({
+                                'type': 'error',
+                                'message': f'Layer login failed: {r2}'
+                            }))
+                            continue
+                else:
+                    await ws.send(json.dumps({
+                        'type': 'error',
+                        'message': f'Unknown handshake: {r1}'
+                    }))
+                    continue
 
                 await rcon('admin.eventsEnabled', 'true')
 
@@ -255,16 +280,14 @@ async def handler(ws):
                 sname = ri[1] if ri and len(ri) > 1 else host
 
                 await ws.send(json.dumps({
-                    'type': 'connected',
-                    'serverName': sname
+                    'type': 'connected', 'serverName': sname
                 }))
-                print(f"[✓] Authenticated as {username} — {sname}")
+                print(f"[✓] Auth OK — {sname}")
 
                 await refresh_players()
                 await refresh_info()
                 await refresh_maplist()
 
-            # COMMAND
             elif msg['type'] == 'cmd':
                 if not writer:
                     await ws.send(json.dumps({
@@ -290,7 +313,6 @@ async def handler(ws):
             try: writer.close()
             except: pass
 
-# ── MAIN ───────────────────────────────────────────────────
 async def main():
     print(f"PRoCon Proxy — porta {PORT}")
     async with serve(handler, '0.0.0.0', PORT):
