@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PRoCon Mobile — WebSocket ↔ BF4 RCON Proxy
-Deploy: Railway.app
+BF4 RCON: servidor fala primeiro enviando o salt diretamente
 """
 
 import asyncio
@@ -44,13 +44,33 @@ def parse_packets(buf):
         rest = rest[total:]
     return packets, rest
 
+async def read_one(reader, timeout=8.0):
+    """Lê um único pacote do servidor."""
+    buf = b''
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            return None
+        try:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining)
+            if not chunk:
+                return None
+            buf += chunk
+            pkts, _ = parse_packets(buf)
+            if pkts:
+                print(f"[read_one] {pkts[0]['words']}")
+                return pkts[0]
+        except asyncio.TimeoutError:
+            return None
+
 async def handler(ws):
     print(f"[+] {ws.remote_address}")
     reader = writer = None
     buf = b''
     pending = {}
 
-    async def send(*words):
+    async def send_cmd(*words):
         pkt, seq = mk_packet(list(words))
         fut = asyncio.get_event_loop().create_future()
         pending[seq] = fut
@@ -86,32 +106,27 @@ async def handler(ws):
         cmd = words[0]
         if cmd == 'player.onChat':
             await ws.send(json.dumps({
-                'type':'chat',
-                'player': words[1] if len(words)>1 else '?',
-                'text':   words[2] if len(words)>2 else '',
-                'subset': words[3] if len(words)>3 else 'All',
-                'isAdmin': False
+                'type':'chat','player':words[1] if len(words)>1 else '?',
+                'text':words[2] if len(words)>2 else '','subset':words[3] if len(words)>3 else 'All','isAdmin':False
             }))
         elif cmd in ('player.onJoin','player.onLeave'):
             await refresh_players()
 
     async def refresh_players():
-        r = await send('admin.listPlayers','all')
+        r = await send_cmd('admin.listPlayers','all')
         if r: await ws.send(json.dumps({'type':'players','players':parse_playerlist(r)}))
 
     async def refresh_info():
-        r = await send('serverInfo')
+        r = await send_cmd('serverInfo')
         if r and r[0]=='OK' and len(r)>5:
             scores = {}
-            try: scores = {'team1':int(r[8]) if len(r)>8 else 0,'team2':int(r[9]) if len(r)>9 else 0}
+            try: scores={'team1':int(r[8]) if len(r)>8 else 0,'team2':int(r[9]) if len(r)>9 else 0}
             except: pass
-            await ws.send(json.dumps({
-                'type':'serverInfo','serverName':r[1] if len(r)>1 else '',
-                'mapName':r[4] if len(r)>4 else '','modeName':r[5] if len(r)>5 else '','scores':scores
-            }))
+            await ws.send(json.dumps({'type':'serverInfo','serverName':r[1] if len(r)>1 else '',
+                'mapName':r[4] if len(r)>4 else '','modeName':r[5] if len(r)>5 else '','scores':scores}))
 
     async def refresh_maplist():
-        r = await send('mapList.list','0')
+        r = await send_cmd('mapList.list','0')
         maps = []
         if r and r[0]=='OK' and len(r)>2:
             try:
@@ -120,8 +135,8 @@ async def handler(ws):
                     if idx+1<len(r): maps.append({'map':r[idx],'mode':r[idx+1]})
                     idx+=3
             except: pass
-        ci = await send('mapList.getMapIndices')
-        cur = int(ci[1]) if ci and len(ci)>1 else 0
+        ci = await send_cmd('mapList.getMapIndices')
+        cur=int(ci[1]) if ci and len(ci)>1 else 0
         await ws.send(json.dumps({'type':'mapList','maps':maps,'currentIdx':cur}))
 
     def parse_playerlist(words):
@@ -156,21 +171,57 @@ async def handler(ws):
                     await ws.send(json.dumps({'type':'error','message':f'Cannot connect: {e}'}))
                     continue
 
-                asyncio.ensure_future(recv_loop())
+                # ── BF4 RCON: servidor envia login.hashed com salt primeiro ──
+                # Lê o primeiro pacote que o servidor envia
+                first = await read_one(reader, timeout=5.0)
+                print(f"[first packet] {first}")
 
-                # BF4 RCON: cliente envia "version" primeiro
-                r_ver = await send('version')
-                print(f"[version] {r_ver}")
+                salt = None
 
-                # Agora pede o salt
-                r1 = await send('login.hashed')
-                print(f"[login.hashed] {r1}")
+                if first and first['words']:
+                    words = first['words']
+                    cmd = words[0]
 
-                if not r1 or r1[0] != 'OK' or len(r1) < 2:
-                    await ws.send(json.dumps({'type':'error','message':f'Handshake failed: {r1}'}))
+                    if cmd == 'login.hashed' and len(words) >= 2:
+                        # Servidor enviou salt diretamente
+                        salt = words[1]
+                        print(f"[✓] Server sent salt: {salt}")
+
+                    elif cmd == 'version':
+                        # Servidor enviou versão — agora pede salt
+                        print(f"[version] {words}")
+                        asyncio.ensure_future(recv_loop())
+                        r1 = await send_cmd('login.hashed')
+                        print(f"[login.hashed] {r1}")
+                        if r1 and r1[0] == 'OK' and len(r1) >= 2:
+                            salt = r1[1]
+
+                    else:
+                        # Outro pacote — inicia recv_loop e tenta login.hashed
+                        print(f"[unknown first] {words} — trying login.hashed")
+                        asyncio.ensure_future(recv_loop())
+                        r1 = await send_cmd('login.hashed')
+                        print(f"[login.hashed] {r1}")
+                        if r1 and r1[0] == 'OK' and len(r1) >= 2:
+                            salt = r1[1]
+
+                else:
+                    # Nada recebido — servidor espera que cliente fale
+                    print(f"[no first packet] — trying version then login.hashed")
+                    asyncio.ensure_future(recv_loop())
+                    await send_cmd('version')
+                    r1 = await send_cmd('login.hashed')
+                    print(f"[login.hashed after version] {r1}")
+                    if r1 and r1[0] == 'OK' and len(r1) >= 2:
+                        salt = r1[1]
+
+                if not salt:
+                    await ws.send(json.dumps({'type':'error','message':'Could not get salt from server'}))
                     continue
 
-                salt = r1[1]
+                # Garante recv_loop rodando
+                if not any(True for t in asyncio.all_tasks() if 'recv_loop' in str(t)):
+                    asyncio.ensure_future(recv_loop())
 
                 # Hash: MD5(salt_bytes + password_bytes)
                 try:
@@ -181,16 +232,15 @@ async def handler(ws):
                     await ws.send(json.dumps({'type':'error','message':f'Hash error: {e}'}))
                     continue
 
-                r2 = await send('login.hashed', hashed)
+                r2 = await send_cmd('login.hashed', hashed)
                 print(f"[login result] {r2}")
 
                 if not r2 or r2[0] != 'OK':
                     await ws.send(json.dumps({'type':'error','message':'Wrong password'}))
                     continue
 
-                await send('admin.eventsEnabled','true')
-
-                ri = await send('serverInfo')
+                await send_cmd('admin.eventsEnabled','true')
+                ri = await send_cmd('serverInfo')
                 sname = ri[1] if ri and len(ri)>1 else host
 
                 await ws.send(json.dumps({'type':'connected','serverName':sname}))
@@ -204,10 +254,9 @@ async def handler(ws):
                 if not writer:
                     await ws.send(json.dumps({'type':'error','message':'Not connected'}))
                     continue
-                r = await send(msg.get('cmd',''), *msg.get('args',[]))
+                r = await send_cmd(msg.get('cmd',''), *msg.get('args',[]))
                 await ws.send(json.dumps({
-                    'type':'cmdResult',
-                    'result':' '.join(r) if r else 'no response',
+                    'type':'cmdResult','result':' '.join(r) if r else 'no response',
                     'ok':bool(r and r[0]=='OK')
                 }))
 
