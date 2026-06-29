@@ -32,6 +32,23 @@ def compute_hash(salt_hex, password):
     print(f"[hash] {final[:8]}...")
     return final
 
+def parse_maplist(r):
+    maps = []
+    if not r or r[0] != "OK" or len(r) < 3: return maps
+    try:
+        n = int(r[1]); wpmap = int(r[2]); idx = 3
+        for _ in range(n):
+            if idx + 2 <= len(r):
+                maps.append({
+                    "map": r[idx],
+                    "mode": r[idx+1],
+                    "rounds": int(r[idx+2]) if idx+2 < len(r) else 1
+                })
+            idx += wpmap
+    except Exception as e:
+        print(f"[parse_maplist] {e}")
+    return maps
+
 async def handler(ws):
     print(f"[+] {ws.remote_address}")
     reader = writer = None
@@ -118,8 +135,6 @@ async def handler(ws):
         if not r or r[0] != "OK": return None
         try:
             scores = {}
-            # scores vêm depois de roundsTotal (idx 7)
-            # formato: OK name players maxPlayers mode map roundsPlayed roundsTotal score0 score1 ...
             if len(r) > 9:
                 scores = {"team1": round(float(r[8])), "team2": round(float(r[9]))}
             return {
@@ -167,14 +182,7 @@ async def handler(ws):
             try: await ws.send(json.dumps({"type":"players","players":parse_pl(r)}))
             except: pass
         r = await send_cmd("mapList.list","0")
-        maps = []
-        if r and r[0]=="OK" and len(r)>2:
-            try:
-                wpmap=int(r[1]); n=int(r[2]); idx=3
-                for _ in range(n):
-                    if idx+2<=len(r): maps.append({"map":r[idx],"mode":r[idx+1],"rounds":int(r[idx+2]) if idx+2<len(r) else 1})
-                    idx+=wpmap
-            except: pass
+        maps = parse_maplist(r)
         ci = await send_cmd("mapList.getMapIndices")
         cur = int(ci[1]) if ci and len(ci)>1 else 0
         try: await ws.send(json.dumps({"type":"mapList","maps":maps,"currentIdx":cur}))
@@ -204,14 +212,18 @@ async def handler(ws):
                     except: pass
                     continue
                 r = await send_cmd(msg.get("cmd",""), *msg.get("args",[]))
-                try: await ws.send(json.dumps({"type":"cmdResult",
-                    "result":" ".join(r) if r else "sem resposta",
-                    "ok":bool(r and r[0]=="OK")}))
-                except: pass
+                # trata InsufficientPrivileges
+                if r and r[0] == "InsufficientPrivileges":
+                    try: await ws.send(json.dumps({"type":"cmdResult","result":"Acesso limitado","ok":False,"limited":True}))
+                    except: pass
+                else:
+                    try: await ws.send(json.dumps({"type":"cmdResult",
+                        "result":" ".join(r) if r else "sem resposta",
+                        "ok":bool(r and r[0]=="OK")}))
+                    except: pass
 
             elif msg["type"] == "refresh":
                 if not writer: continue
-                # semáforo — evita flood
                 if refresh_lock.locked(): continue
                 async with refresh_lock:
                     what = msg.get("what","players")
@@ -233,14 +245,7 @@ async def handler(ws):
                         except: pass
                     elif what == "maplist":
                         r = await send_cmd("mapList.list","0")
-                        maps = []
-                        if r and r[0]=="OK" and len(r)>2:
-                            try:
-                                wpmap=int(r[1]); n=int(r[2]); idx=3
-                                for _ in range(n):
-                                    if idx+2<=len(r): maps.append({"map":r[idx],"mode":r[idx+1],"rounds":int(r[idx+2]) if idx+2<len(r) else 1})
-                                    idx+=wpmap
-                            except: pass
+                        maps = parse_maplist(r)
                         ci = await send_cmd("mapList.getMapIndices")
                         cur = int(ci[1]) if ci and len(ci)>1 else 0
                         try: await ws.send(json.dumps({"type":"mapList","maps":maps,"currentIdx":cur}))
@@ -258,7 +263,7 @@ async def handler(ws):
             except: pass
 
 async def main():
-    print(f"PRoCon Proxy v2.4 — porta {PORT}")
+    print(f"PRoCon Proxy v2.5 — porta {PORT}")
     async with serve(handler, "0.0.0.0", PORT):
         await asyncio.Future()
 
