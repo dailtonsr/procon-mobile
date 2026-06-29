@@ -184,11 +184,12 @@ input::placeholder{color:var(--text3)}
     <div id="player-count"></div>
     <div class="refresh-indicator" id="refresh-dot"></div>
     <button class="top-btn" id="btn-reconnect" onclick="manualReconnect()">↺ Reconectar</button>
+    <button class="top-btn" onclick="restartProxy()" style="border-color:rgba(239,68,68,.3);color:var(--red)" title="Reiniciar Proxy">⟳ Proxy</button>
     <button class="top-btn" id="btn-disconnect" onclick="disconnect()" style="display:none">✕</button>
   </div>
   <div id="content">
     <div class="screen active" id="screen-connect">
-      <div class="logo"><div class="logo-text">PRoCon</div><div class="logo-sub">Battlefield 4 · Admin Mobile · v2.5</div></div>
+      <div class="logo"><div class="logo-text">PRoCon</div><div class="logo-sub">Battlefield 4 · Admin Mobile · v2.6</div></div>
       <div class="card">
         <div class="card-title">Servidor</div>
         <div class="field"><label>Host</label><input type="text" id="inp-host" class="input-mono" placeholder="server.example.com"></div>
@@ -272,7 +273,7 @@ input::placeholder{color:var(--text3)}
     </div>
 
     <div class="screen" id="screen-console">
-      <div id="console-log"><span class="log-info">PRoCon Mobile v2.5 — Pronto.</span><br></div>
+      <div id="console-log"><span class="log-info">PRoCon Mobile v2.6 — Pronto.</span><br></div>
       <div id="console-input-row">
         <input type="text" id="console-cmd" class="input-mono" placeholder="serverInfo" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
         <button id="btn-console-send" onclick="sendConsoleCmd()">▶</button>
@@ -315,6 +316,8 @@ input::placeholder{color:var(--text3)}
 
 <script>
 const PROXY_URL = 'wss://proxy.bf4brasilhc.com.br';
+const CONTROL_URL = 'https://control.bf4brasilhc.com.br';
+const CONTROL_SENHA = 'procon2026';
 const REASONS = ["Hack/Trapaça","Abuso de admin","Liberar vaga para membros","Desrespeito","Team Kill","Spawn Kill","Atacar base inimiga","Equilíbrio de equipes","Troca para time vencedor"];
 const SQUADS = ['','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'];
 const MAP_NAMES = {
@@ -366,6 +369,20 @@ function toast(msg,type='',duration=4000){
   clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast',duration);
 }
 
+async function restartProxy(){
+  if(!confirm('Reiniciar o proxy?\nA conexão será reestabelecida em alguns segundos.'))return;
+  try{
+    toast('Reiniciando proxy...','warn');
+    const r=await fetch(`${CONTROL_URL}/restart?senha=${CONTROL_SENHA}`);
+    if(r.ok){
+      toast('Proxy reiniciando — reconectando em 5s...','warn',6000);
+      setTimeout(()=>{if(S.host)doConnect();},5000);
+    } else {
+      toast('Falha ao reiniciar','error');
+    }
+  }catch(e){toast('Erro ao contatar controle','error');}
+}
+
 function getSaved(){try{return JSON.parse(localStorage.getItem('procon_v2')||'[]');}catch{return[];}}
 function saveServer(host,port,game,pass){
   const list=getSaved().filter(s=>!(s.host===host&&s.port===port));
@@ -402,7 +419,6 @@ function doConnect(){
   ws.onclose=()=>{clearTimers();if(S.connected){S.connected=false;updateTopBar(false);logConsole('Conexão perdida','err');toast('Desconectado','error');document.getElementById('btn-reconnect').style.display='block';scheduleReconnect();}hideConnecting();};
   setTimeout(()=>{if(ws.readyState!==WebSocket.OPEN){hideConnecting();toast('Timeout','error');document.getElementById('btn-connect').disabled=false;}},15000);
 }
-
 function disconnect(){clearTimers();if(S.ws){try{S.ws.close();}catch{}S.ws=null;}S.connected=false;S.players=[];updateTopBar(false);showScreen('connect');toast('Desconectado');document.getElementById('btn-reconnect').style.display='none';}
 function manualReconnect(){document.getElementById('btn-reconnect').style.display='none';if(S.host)doConnect();else showScreen('connect');}
 function scheduleReconnect(){clearTimeout(S.reconnectTimer);S.reconnectTimer=setTimeout(()=>{if(!S.connected&&S.host){logConsole('Reconectando...','warn');doConnect();}},8000);}
@@ -426,8 +442,7 @@ function handleMsg(msg){
     case 'connected':
       hideConnecting();S.connected=true;S.serverName=msg.serverName||S.host;
       updateTopBar(true);saveServer(S.host,S.port,document.getElementById('inp-game').value,S.pass);
-      // mantém tela atual se já estava em alguma aba, senão vai para jogadores
-      if(S.currentScreen==='connect') showScreen('players');
+      if(S.currentScreen==='connect')showScreen('players');
       toast('Conectado! 🎮','success');logConsole('✓ '+S.serverName,'ok');
       startAutoRefresh();document.getElementById('btn-reconnect').style.display='none';break;
     case 'error':hideConnecting();toast(msg.message,'error');logConsole('✗ '+msg.message,'err');document.getElementById('btn-connect').disabled=false;break;
@@ -440,7 +455,7 @@ function handleMsg(msg){
     case 'mapList':S.mapList=msg.maps||[];S.currentMapIdx=msg.currentIdx||0;renderMap();if(S.currentListTab==='maplist')renderListTab();break;
     case 'reservedSlots':S.reserved=msg.slots||[];if(S.currentListTab==='reserved')renderListTab();renderPlayers();break;
     case 'cmdResult':
-      if(msg.limited) toast('Acesso limitado','warn');
+      if(msg.limited)toast('Acesso limitado','warn');
       else logConsole((msg.ok?'✓ ':'✗ ')+msg.result,msg.ok?'ok':'err');
       break;
     case 'event':if(msg.event==='levelLoaded'){S.mapName=msg.map||S.mapName;S.modeName=msg.mode||S.modeName;renderMap();}break;
@@ -471,7 +486,8 @@ function renderPlayers(filter){
     const sorted=sortArr(arr);
     const tickets=S.scores?(num===1?S.scores.team1:S.scores.team2)||0:0;
     const teamLabel=num===1?'🔵 US Army':'🔴 Russian Army';
-    let rows=`<tr class="team-header-row ${num===2?'team2':''}"><td colspan="9">${teamLabel}${tickets?' — '+tickets+' Tickets':''}</td></tr>`;
+    const ticketStr=tickets>0?` — ${tickets} Tickets`:'';
+    let rows=`<tr class="team-header-row ${num===2?'team2':''}"><td colspan="9">${teamLabel}${ticketStr}</td></tr>`;
     let totK=0,totD=0,totS=0,totP=0;
     sorted.forEach(p=>{
       const kd=p.deaths>0?(p.kills/p.deaths).toFixed(2):'∞';
@@ -552,10 +568,18 @@ function renderMap(){
   const t1=S.scores.team1||0,t2=S.scores.team2||0;
   const tc1=S.players.filter(p=>p.team===1).length,tc2=S.players.filter(p=>p.team===2).length;
   el.innerHTML=`
-    <div class="map-card"><div class="map-mode">${mode}</div><div class="map-name">${map}</div>
-      <div class="map-scores"><div class="team-score-box"><div class="ts-label">🔵 US</div><div class="ts-val t1">${t1}</div></div><div class="team-score-box"><div class="ts-label">🔴 RU</div><div class="ts-val t2">${t2}</div></div></div>
+    <div class="map-card">
+      <div class="map-mode">${mode}</div>
+      <div class="map-name">${map}</div>
+      <div class="map-scores">
+        <div class="team-score-box"><div class="ts-label">🔵 US Army</div><div class="ts-val t1">${t1}</div></div>
+        <div class="team-score-box"><div class="ts-label">🔴 Russian Army</div><div class="ts-val t2">${t2}</div></div>
+      </div>
     </div>
-    <div class="stat-grid"><div class="stat-box"><div class="stat-label">Jogadores</div><div class="stat-val">${S.players.length}/${S.maxPlayers}</div></div><div class="stat-box"><div class="stat-label">Equilíbrio</div><div class="stat-val">${tc1}v${tc2}</div></div></div>
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-label">Jogadores</div><div class="stat-val">${S.players.length}/${S.maxPlayers}</div></div>
+      <div class="stat-box"><div class="stat-label">Equilíbrio</div><div class="stat-val">${tc1}v${tc2}</div></div>
+    </div>
     <div class="section-label">Ações do Servidor</div>
     <div class="action-grid">
       <div class="action-btn warning" onclick="srvAction('next')"><div class="ab-icon">⏭️</div><div class="ab-label">Próximo Mapa</div></div>
